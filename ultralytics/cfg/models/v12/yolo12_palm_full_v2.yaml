@@ -1,0 +1,44 @@
+nc: 4
+scales:
+  n: [0.50, 0.25, 1024] # summary: 497 layers, 2,553,904 parameters, 2,553,888 gradients, 6.2 GFLOPs
+  #s: [0.50, 0.50, 1024] # summary: 497 layers, 9,127,424 parameters, 9,127,408 gradients, 19.7 GFLOPs
+  #m: [0.50, 1.00, 512] # summary: 533 layers, 19,670,784 parameters, 19,670,768 gradients, 60.4 GFLOPs
+  #l: [1.00, 1.00, 512] # summary: 895 layers, 26,506,496 parameters, 26,506,480 gradients, 83.3 GFLOPs
+  #x: [1.00, 1.50, 512] # summary: 895 layers, 59,414,176 parameters, 59,414,160 gradients, 185.9 GFLOPs
+
+backbone:
+  - [-1, 1, Conv,  [64, 3, 2]]                # 0-P1/2
+  - [-1, 1, Conv,  [128, 3, 2, 1, 2]]         # 1-P2/4
+  - [-1, 2, C3k2,  [256, False, 0.25]]        # 2
+  - [-1, 1, Conv,  [256, 3, 2, 1, 4]]         # 3-P3/8
+  - [-1, 2, C3k2,  [512, False, 0.25]]        # 4  backbone P3
+  - [-1, 1, Conv,  [512, 3, 2]]               # 5-P4/16
+  - [-1, 4, A2C2f, [512, True, 4]]            # 6  backbone P4
+  - [-1, 1, Conv,  [1024, 3, 2]]              # 7-P5/32
+  - [-1, 4, A2C2f, [1024, True, 1]]           # 8  backbone P5
+
+head:
+  # HARFM cross-scale fusion
+  - [[4, 6], 1, HARFM, [256]]                 # 9   P3-P4 refined (P3 spatial size)
+  - [[6, 8], 1, HARFM, [512]]                 # 10  P4-P5 refined (P4 spatial size)
+
+  # P3 branch — HARFM output 9 is already at P3 size, no upsample needed
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 11  upsample P4-refined to P3 size
+  - [[-1, 9], 1, Concat, [1]]                  # 12  concat with P3-refined
+  - [-1, 2, A2C2f, [256, False, -1]]           # 13  P3 out
+
+  # P4 branch
+  - [10, 2, A2C2f, [512, False, -1]]           # 14  P4 out
+
+  # P5 branch
+  - [10, 1, Conv, [512, 3, 2]]                 # 15
+  - [[-1, 8], 1, Concat, [1]]                  # 16
+  - [-1, 2, C3k2, [1024, True]]                # 17  P5 out
+
+  # DyHead
+  - [13, 1, DyHead, [256, 4]]                  # 18  DyHead on P3
+  - [14, 1, DyHead, [512, 4]]                  # 19  DyHead on P4
+  - [17, 1, DyHead, [1024, 2]]                 # 20  DyHead on P5
+
+  # Detect
+  - [[18, 19, 20], 1, Detect, [nc]]

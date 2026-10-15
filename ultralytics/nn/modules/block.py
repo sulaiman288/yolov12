@@ -27,8 +27,17 @@ __all__ = (
     "C3x",
     "C3TR",
     "C3Ghost",
+    "C3HorNet",
+    "C3HorBlock",
+    "C3HorBlock_light",
     "GhostBottleneck",
     "Bottleneck",
+    "gnconv",
+    "SpatialBottleneck",
+    "DropPath",
+    "MLP",
+    "HorBlock",
+    "NAM",
     "BottleneckCSP",
     "Proto",
     "RepC3",
@@ -50,8 +59,421 @@ __all__ = (
     "PSA",
     "SCDown",
     "TorchVision",
+    "GDRConv",
+    "TDAM",
+    "CTDAM",
+    "GTDRBlock",
+    "GTDRBlock_CTDAM",
+    "HARFM",
+    "FFAM",
+    "ELA",
+    "DyHead",
+    "DyHeadBlock",
 )
 
+class DyHeadBlock(nn.Module):
+    """
+    Dynamic Head Block (Dai et al., CVPR 2021).
+    Applies three sequential attention mechanisms:
+      1. Scale-aware attention (across feature levels)
+      2. Spatial-aware attention (deformable convolution)
+      3. Task-aware attention (dynamic ReLU on channels)
+    
+    Simplified version compatible with Ultralytics single-level input.
+    Each detection head feature map is processed independently.
+    """
+
+    def __init__(self, c1, c2, num_heads=4):
+        super().__init__()
+        self.c1 = c1
+        self.c2 = c2
+
+        # Scale-aware attention
+        self.scale_attn = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c1, c1, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c1, c1, 1),
+            nn.Hardsigmoid(inplace=True),
+        )
+
+        # Spatial-aware attention (use standard deformable-like conv)
+        self.offset_conv = nn.Conv2d(c1, 2 * 3 * 3, 3, padding=1, bias=True)
+        self.spatial_conv = nn.Conv2d(c1, c2, 3, padding=1, bias=False)
+        self.spatial_bn = nn.BatchNorm2d(c2)
+
+        # Task-aware attention (Dynamic ReLU)
+        self.task_fc1 = nn.Conv2d(c2, c2 // 4, 1)
+        self.task_fc2 = nn.Conv2d(c2 // 4, c2 * 2, 1)  # alpha and beta
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.zeros_(self.offset_conv.weight)
+        nn.init.zeros_(self.offset_conv.bias)
+
+    def forward(self, x):
+        # 1. Scale-aware attention
+        scale_attn = self.scale_attn(x)
+        x = x * scale_attn
+
+        # 2. Spatial-aware attention
+        x = self.spatial_bn(self.spatial_conv(x))
+
+        # 3. Task-aware attention (DyReLU)
+        avg = F.adaptive_avg_pool2d(x, 1)
+        task_params = self.task_fc2(F.relu(self.task_fc1(avg)))
+        alpha, beta = torch.split(task_params, self.c2, dim=1)
+        alpha = alpha.sigmoid()  # gating
+        x = x * alpha + beta
+
+        return x
+
+class DyHead(nn.Module):
+    """
+    Multi-block DyHead module for YOLO detection heads.
+    Stacks multiple DyHeadBlocks sequentially.
+    
+    Args:
+        c1 (int): Input channels.
+        c2 (int): Output channels.
+        num_blocks (int): Number of DyHead blocks to stack. Default: 2.
+    """
+
+    def __init__(self, c1, c2, num_blocks=2):
+        super().__init__()
+        self.blocks = nn.Sequential(
+            *[DyHeadBlock(c1 if i == 0 else c2, c2) for i in range(num_blocks)]
+        )
+        # Channel projection if needed
+        self.proj = nn.Conv2d(c1, c2, 1) if c1 != c2 else nn.Identity()
+
+    def forward(self, x):
+        x = self.proj(x)
+        return self.blocks(x)
+
+class ELA(nn.Module):
+    """
+    Efficient Local Attention-style gating used inside FFAM.
+
+    This is a lightweight spatial-channel attention approximation:
+    - pool along width to keep vertical structure
+    - pool along height to keep horizontal structure
+    - project each with 1x1 conv
+    - combine as multiplicative attention
+
+    Input/output shape: [B, C, H, W]
+    """
+
+    def __init__(self, c: int, groups: int = 16):
+        super().__init__()
+        g = max(1, min(groups, c))
+        while c % g != 0 and g > 1:
+            g -= 1
+
+        self.conv_h = nn.Conv2d(c, c, kernel_size=1, stride=1, padding=0, bias=True)
+        self.conv_w = nn.Conv2d(c, c, kernel_size=1, stride=1, padding=0, bias=True)
+        self.gn_h = nn.GroupNorm(g, c)
+        self.gn_w = nn.GroupNorm(g, c)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Height-aware descriptor: B,C,H,1
+        x_h = x.mean(dim=3, keepdim=True)
+        # Width-aware descriptor: B,C,1,W
+        x_w = x.mean(dim=2, keepdim=True)
+
+        a_h = torch.sigmoid(self.gn_h(self.conv_h(x_h)))
+        a_w = torch.sigmoid(self.gn_w(self.conv_w(x_w)))
+
+        return a_h * a_w
+
+class HARFM(nn.Module):
+    """
+    HARFM: High- and Adjacent-level Recalibration Fusion Module
+    Output resolution is aligned to the LOW-resolution input branch by default
+    in terms of pyramid level naming:
+      [P3, P4] -> output P3 spatial size
+      [P4, P5] -> output P4 spatial size
+    """
+
+    def __init__(
+        self,
+        c1,
+        c2,
+        reduction: int =2,
+        use_gn: bool = True,
+        residual: bool = True,
+    ):
+        super().__init__()
+
+        # This section is where the module is configud in 2 sections:
+        assert isinstance(c1, (list, tuple)) and len(c1) == 2, \
+            f"HARFM expects c1 as [c_low, c_high], got {c1}"
+
+        c_low, c_high = c1 # split theb channels into low and high branches
+        hidden = max(c2 // max(int(reduction), 1), 16) 
+
+        #  project low and high branches to c2 channels for fusion
+        self.low_proj = Conv(c_low, c2, k=3, s=1) 
+        self.high_proj = Conv(c_high, c2, k=1, s=1)
+
+        # fuse low and high features with simple concatenation followed by 1x1 conv to mix channels
+        self.fuse_in = Conv(2 * c2, c2, k=1, s=1)
+
+        # generate attention weights with a lightweight bottleneck: dw -> pw -> act -> dw -> pw -> sigmoid
+        self.dw1 = nn.Conv2d(c2, c2, kernel_size=3, stride=1, padding=1, groups=c2, bias=False)
+        self.pw1 = nn.Conv2d(c2, hidden, kernel_size=1, stride=1, padding=0, bias=False)
+        self.dw2 = nn.Conv2d(hidden, hidden, kernel_size=3, stride=1, padding=1, groups=hidden, bias=False)
+        self.pw2 = nn.Conv2d(hidden, c2, kernel_size=1, stride=1, padding=0, bias=False)
+
+        # Typicaly default ot GroupNnnorm but can be switched to BatchNorm or Identity if desired. GroupNorm with groups=16 is a common choice for attention modules.
+        if use_gn:
+            g = min(16, c2)
+            while c2 % g != 0 and g > 1:
+                g -= 1
+            self.norm = nn.GroupNorm(g, c2)
+        else:
+            self.norm = nn.BatchNorm2d(c2)
+
+        # Activation function and output projection. Sigmoid is used to generate attention weights in the range [0,1]. The output projection is a 3x3 conv that produces the final recalibrated feature map.
+        self.act = nn.ReLU(inplace=True)
+        self.sigmoid = nn.Sigmoid()
+        self.residual = residual
+        self.out_proj = Conv(c2, c2, k=3, s=1)
+
+    def forward(self, xs):
+        assert isinstance(xs, (list, tuple)) and len(xs) == 2, \
+            f"HARFM forward expects [x_low, x_high], got {type(xs)}"
+
+        x_low, x_high = xs
+
+        # IMPORTANT:
+        # align to low-side spatial size so:
+        # [P3, P4] -> output P3 size
+        # [P4, P5] -> output P4 size
+        target_size = x_low.shape[2:]
+
+        if x_high.shape[2:] != target_size:
+            x_high = F.interpolate(x_high, size=target_size, mode="nearest")
+
+        x_low = self.low_proj(x_low)
+        x_high = self.high_proj(x_high)
+
+        x = torch.cat([x_low, x_high], dim=1)
+        x = self.fuse_in(x)
+        identity = x
+
+        w = self.dw1(x)
+        w = self.pw1(w)
+        w = self.act(w)
+        w = self.dw2(w)
+        w = self.pw2(w)
+        w = self.norm(w)
+        w = self.sigmoid(w)
+
+        x = identity * w + identity # if self.residual else identity * w
+        return self.out_proj(x)
+
+class FFAM(nn.Module):
+    """
+    FFAM: Feature Filtering and Aggregation Module
+    Flexible constructor to support YAML phases:
+      Phase 1: FFAM, [c2]
+      Phase 2: FFAM, [c2, use_ela, kernels]
+      Phase 3: FFAM, [c2, use_ela, kernels, residual]
+
+    Expected inputs:
+      xs = [x_low, x_mid, x_high]
+
+    Design goals:
+    - align all 3 scales to the mid scale
+    - filter low and mid features with semantic/spatial attention
+    - aggregate into one fused mid-scale feature
+    - enrich with multi-kernel depthwise branches
+    """
+
+    def __init__(
+        self,
+        c1,
+        c2,
+        use_ela: bool = True,
+        kernels=(5, 7, 9, 11),
+        residual: bool = True,
+    ):
+        super().__init__()
+
+        assert isinstance(c1, (list, tuple)) and len(c1) == 3, \
+            f"FFAM expects c1 as [c_low, c_mid, c_high], got {c1}"
+
+        c_low, c_mid, c_high = c1
+
+        self.low_proj = Conv(c_low, c2, k=3, s=1)
+        self.mid_proj = Conv(c_mid, c2, k=3, s=1)
+        self.high_proj = Conv(c_high, c2, k=1, s=1)
+
+        self.use_ela = use_ela
+        self.residual = residual
+
+        if self.use_ela:
+            self.ela_mid = ELA(c2)
+            self.ela_high = ELA(c2)
+
+        # fuse aligned features first
+        self.pre_fuse = Conv(c2, c2, k=3, s=1)
+
+        # multi-kernel depthwise branches
+        self.dw_branches = nn.ModuleList()
+        for k in kernels:
+            assert isinstance(k, int) and k % 2 == 1, f"FFAM kernels must be odd ints, got {k}"
+            self.dw_branches.append(
+                nn.Conv2d(c2, c2, kernel_size=k, stride=1, padding=k // 2, groups=c2, bias=False)
+            )
+
+        self.branch_bn = nn.ModuleList([nn.BatchNorm2d(c2) for _ in kernels])
+        self.branch_act = nn.SiLU()
+
+        self.post_fuse = Conv(c2 * len(kernels), c2, k=1, s=1)
+        self.out_proj = Conv(c2, c2, k=3, s=1)
+
+    def forward(self, xs):
+        assert isinstance(xs, (list, tuple)) and len(xs) == 3, \
+            f"FFAM forward expects [x_low, x_mid, x_high], got type={type(xs)} len={len(xs) if isinstance(xs, (list, tuple)) else 'NA'}"
+
+        x_low, x_mid, x_high = xs
+        target_size = x_mid.shape[2:]  # central fusion hub is mid-scale
+
+        if x_low.shape[2:] != target_size:
+            x_low = F.interpolate(x_low, size=target_size, mode="nearest")
+        if x_high.shape[2:] != target_size:
+            x_high = F.interpolate(x_high, size=target_size, mode="nearest")
+
+        x_low = self.low_proj(x_low)
+        x_mid = self.mid_proj(x_mid)
+        x_high = self.high_proj(x_high)
+
+        if self.use_ela:
+            a_high = self.ela_high(x_high)
+            a_mid = self.ela_mid(x_mid)
+
+            # semantic-guided filtering + self-filtering
+            fused = a_high * x_low + x_high + a_mid * x_mid
+        else:
+            fused = x_low + x_mid + x_high
+
+        fused = self.pre_fuse(fused)
+        identity = fused
+
+        branch_outs = []
+        for dw, bn in zip(self.dw_branches, self.branch_bn):
+            y = dw(fused)
+            y = bn(y)
+            y = self.branch_act(y)
+            branch_outs.append(y)
+
+        x = torch.cat(branch_outs, dim=1)
+        x = self.post_fuse(x)
+
+        if self.residual:
+            x = x + identity
+
+        return self.out_proj(x)                                                                                                                                                                                                                                 
+
+class DropPath(nn.Module):
+    """Stochastic Depth per sample (when applied in main path of residual blocks)."""
+
+    def __init__(self, drop_prob=0.0):
+        super().__init__()
+        self.drop_prob = float(drop_prob)
+
+    def forward(self, x):
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # (B,1,1,1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()
+        return x.div(keep_prob) * random_tensor
+
+class MLP(nn.Module):
+    """Channel MLP using 1x1 convs (ConvNeXt/Transformer style)."""
+    def __init__(self, dim, mlp_ratio=4.0, act_layer=nn.SiLU):
+        super().__init__()
+        hidden = int(dim * mlp_ratio)
+        self.fc1 = nn.Conv2d(dim, hidden, 1, 1, 0, bias=True)
+        self.act = act_layer()
+        self.fc2 = nn.Conv2d(hidden, dim, 1, 1, 0, bias=True)
+
+    def forward(self, x):
+        return self.fc2(self.act(self.fc1(x)))
+
+class HorBlock(nn.Module):
+    """HorNet-style block: (Norm->gnConv->Res) + (Norm->MLP->Res), with optional DropPath."""
+    def __init__(self, dim, order=5, mlp_ratio=4.0, drop_path=0.0):
+        super().__init__()
+        # Cap order to prevent integer division producing zeros in gnconv.
+        # order=k means dims = [dim // 2^(k-1), ..., dim // 1], so max viable order is ~log2(dim).
+        import math
+        max_order = max(1, int(math.log2(dim)))  # At least 1, at most log2(dim)
+        capped_order = min(order, max_order)
+        if capped_order < order:
+            print(f"[HorBlock] order={order} capped to {capped_order} for dim={dim}")
+        
+        self.norm1 = nn.GroupNorm(1, dim)
+        self.gnconv = gnconv(dim, order=capped_order, s=1.0)
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+
+        self.norm2 = nn.GroupNorm(1, dim)
+        self.mlp = MLP(dim, mlp_ratio=mlp_ratio)
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+
+    def forward(self, x):
+        x = x + self.drop_path1(self.gnconv(self.norm1(x)))
+        x = x + self.drop_path2(self.mlp(self.norm2(x)))
+        return x
+
+class NAM(nn.Module):
+    """Normalization-based Attention Module (NAM).
+
+    Lightweight implementation intended to be inserted in neck fusion outputs.
+    Callable from YAML as: [-1, 1, NAM, [c]] where c is number of channels.
+    """
+
+    def __init__(self, c, eps: float = 1e-6, use_abs: bool = True, residual: bool = True, alpha_init: float = 0.1):
+        super().__init__()
+        self.eps = float(eps)
+        self.use_abs = bool(use_abs)
+        self.residual = bool(residual)
+        self.alpha = nn.Parameter(torch.tensor(float(alpha_init))) if self.residual else None
+
+        # BatchNorm with affine weights (gamma) used for channel attention
+        self.bn = nn.BatchNorm2d(c, affine=True, track_running_stats=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # y: normalized features (via BatchNorm)
+        y = self.bn(x)
+
+        # Channel attention via BN gamma (weight)
+        gamma = self.bn.weight  # shape [C]
+        if self.use_abs:
+            gamma = gamma.abs()
+        denom_c = gamma.sum() + self.eps
+        w_c = (gamma / denom_c).view(1, -1, 1, 1)
+        mc = torch.sigmoid(y * w_c)
+
+        # Spatial attention (PN-inspired minimal variant)
+        s = y.mean(dim=1, keepdim=True)  # [B,1,H,W]
+        if self.use_abs:
+            s = s.abs()
+        B = s.shape[0]
+        denom_s = s.view(B, -1).sum(dim=1).view(B, 1, 1, 1) + self.eps
+        w_s = s / denom_s
+        w_s = w_s.clamp(min=-50.0, max=50.0)
+        ms = torch.sigmoid(w_s)
+
+        out = x * mc * ms
+        if self.residual:
+            return x + self.alpha * (out - x)
+        return out
 
 class DFL(nn.Module):
     """
@@ -338,6 +760,7 @@ class Bottleneck(nn.Module):
     def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):
         """Initializes a standard bottleneck module with optional shortcut connection and configurable parameters."""
         super().__init__()
+        print(">>> USING Standard Bottleneck <<<")
         c_ = int(c2 * e)  # hidden channels
         self.cv1 = Conv(c1, c_, k[0], 1)
         self.cv2 = Conv(c_, c2, k[1], 1, g=g)
@@ -347,6 +770,92 @@ class Bottleneck(nn.Module):
         """Applies the YOLO FPN to input data."""
         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
 
+
+class gnconv(nn.Module):
+    """Gated Group Convolution (gnconv) for spatial mixing with multi-order decomposition."""
+
+    def __init__(self, dim, order=5, gflayer=None, h=14, w=8, s=1.0):
+        """Initialize gnconv with multi-order group convolutions.
+        
+        Args:
+            dim (int): Input/output channel dimension.
+            order (int): Order of decomposition. Default: 5.
+            gflayer (nn.Module, optional): Custom gating function layer. Default: None (uses depthwise conv).
+            h (int): Height parameter for custom gflayer. Default: 14.
+            w (int): Width parameter for custom gflayer. Default: 8.
+            s (float): Scaling factor for output. Default: 1.0.
+        """
+        super().__init__()
+        self.order = order
+        self.dims = [dim // 2 ** i for i in range(order)]
+        self.dims.reverse()
+        #self.proj_in = nn.Conv2d(dim, 2 * dim, 1)
+        self.proj_in = nn.Conv2d(dim, self.dims[0] + sum(self.dims), 1) #change this line for next round
+
+
+        if gflayer is None:
+            # Default: use depthwise convolution with kernel size 7
+            self.dwconv = nn.Conv2d(sum(self.dims), sum(self.dims), 7, 1, 3, groups=sum(self.dims))
+        else:
+            self.dwconv = gflayer(sum(self.dims), h=h, w=w)
+
+        self.proj_out = nn.Conv2d(dim, dim, 1)
+
+        self.pws = nn.ModuleList(
+            [nn.Conv2d(self.dims[i], self.dims[i + 1], 1) for i in range(order - 1)]
+        )
+
+        self.scale = s
+
+    def forward(self, x, mask=None, dummy=False):
+        """Forward pass through gnconv.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, C, H, W).
+            mask (torch.Tensor, optional): Mask tensor. Default: None.
+            dummy (bool): Dummy parameter for compatibility. Default: False.
+
+        Returns:
+            torch.Tensor: Output tensor of shape (B, C, H, W).
+        """
+        B, C, H, W = x.shape
+
+        fused_x = self.proj_in(x)
+        pwa, abc = torch.split(fused_x, (self.dims[0], sum(self.dims)), dim=1)
+
+        dw_abc = self.dwconv(abc) * self.scale
+
+        dw_list = torch.split(dw_abc, self.dims, dim=1)
+        x = pwa * dw_list[0]
+
+        for i in range(self.order - 1):
+            x = self.pws[i](x) * dw_list[i + 1]
+
+        x = self.proj_out(x)
+
+        return x
+
+class SpatialBottleneck(nn.Module):
+    """Spatial bottleneck."""
+                                                            #e=0.5
+    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=1.0,gnconv_order=5):
+        """Initializes a standard bottleneck module with optional shortcut connection and configurable parameters."""
+        super().__init__()
+        print(">>> USING Spatial Bottleneck <<<")
+        c_ = int(c2 * e)  # hidden channels
+        self.pw1 = nn.Conv2d(c1, c_, kernel_size=1, stride=1, padding=0, bias=True)
+        self.norm = nn.GroupNorm(1, c_)
+        self.spatial = gnconv(c_, order=gnconv_order, s=1.0)
+        self.pw2 = nn.Conv2d(c_, c2, kernel_size=1, stride=1, padding=0, bias=True)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        """Applies the YOLO FPN to input data."""
+        y = self.pw1(x)
+        y = self.norm(y)
+        y = self.spatial(y)
+        y = self.pw2(y)
+        return x + y if self.add else y
 
 class BottleneckCSP(nn.Module):
     """CSP Bottleneck https://github.com/WongKinYiu/CrossStagePartialNetworks."""
@@ -483,7 +992,7 @@ class ImagePoolingAttn(nn.Module):
         self.key = nn.Sequential(nn.LayerNorm(ec), nn.Linear(ec, ec))
         self.value = nn.Sequential(nn.LayerNorm(ec), nn.Linear(ec, ec))
         self.proj = nn.Linear(ec, ct)
-        self.scale = nn.Parameter(torch.tensor([0.0]), requires_grad=True) if scale else 1.0
+        self.scale = nn.Parameter(torch.teTDAMnsor([0.0]), requires_grad=True) if scale else 1.0
         self.projections = nn.ModuleList([nn.Conv2d(in_channels, ec, kernel_size=1) for in_channels in ch])
         self.im_pools = nn.ModuleList([nn.AdaptiveMaxPool2d((k, k)) for _ in range(nf)])
         self.ec = ec
@@ -727,10 +1236,403 @@ class C3k2(C2f):
 
     def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=True):
         """Initializes the C3k2 module, a faster CSP Bottleneck with 2 convolutions and optional C3k blocks."""
+        print(">>> USING C3k2 Bottleneck <<<")
         super().__init__(c1, c2, n, shortcut, g, e)
         self.m = nn.ModuleList(
-            C3k(self.c, self.c, 2, shortcut, g) if c3k else Bottleneck(self.c, self.c, shortcut, g) for _ in range(n)
+            C3k(self.c, self.c, 2, shortcut, g) 
+            if c3k 
+            else Bottleneck(self.c, self.c, shortcut, g) 
+            for _ in range(n)
         )
+
+class C3HorNet(C2f):
+    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=True):
+        print(">>> USING C3HorNet Bottleneck <<<")
+        """Initializes the C3HorNet module, a CSP Bottleneck with 2 convolutions inspired by HorNet architecture."""
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(
+            C3k(self.c, self.c, 2, shortcut, g) 
+            if c3k 
+            else SpatialBottleneck(self.c, self.c, shortcut)
+            for _ in range(n)
+        )
+
+class C3HorBlock(C2f):
+    def __init__(self, c1, c2, n=1, e=0.5, shortcut=True, g=1, order=5, mlp_ratio=4.0, drop_path=0.0):
+        print(">>> USING C3HorBlock Bottleneck <<<")
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(
+            HorBlock(self.c, order=order, mlp_ratio=mlp_ratio, drop_path=drop_path) 
+            for _ in range(n))
+
+class C3HorBlock_light(C2f):
+    """Lighter variant of C3HorBlock with reduced order and MLP hidden ratio to cut parameters/FLOPs."""
+
+    def __init__(self, c1, c2, n=1, e=0.5, shortcut=True, g=1, order=3, mlp_ratio=1.0, drop_path=0.0):
+        print(">>> USING C3HorBlock_light Bottleneck <<<")
+        super().__init__(c1, c2, n, shortcut, g, e)
+        # Lower `order` reduces gnconv channel splits; lower `mlp_ratio` shrinks MLP hidden dim
+        self.m = nn.ModuleList(
+            HorBlock(self.c, order=order, mlp_ratio=mlp_ratio, drop_path=drop_path)
+            for _ in range(n)
+        )
+
+# This one got the best results so far
+class GDRConv(nn.Module):
+    def __init__(self, c1, c2, k=1, s=1):
+        super().__init__()
+
+        hidden = c2 // 2
+
+        self.primary = nn.Sequential(
+            nn.Conv2d(c1, hidden, k, s, autopad(k), bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU()
+        )
+
+        self.cheap = nn.Sequential(
+            nn.Conv2d(hidden, hidden, 3, 1, 1, groups=hidden, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU()
+        )
+
+    def forward(self, x):
+        y1 = self.primary(x)
+        y2 = self.cheap(y1)
+        return torch.cat([y1, y2], dim=1)
+    
+# This one got the worse results - might be issue with implementation. 
+
+# Implementation of GTDR-Conv replacement of Conv blocks 
+
+# class GDRConv(nn.Module):
+#     """
+#     GDR-Conv (Ghost + DyReLU) as described:
+
+#       1) Primary branch: 1x1 Conv -> BN -> DyReLU
+#       2) Expansion branch (sequential): DW 5x5 -> (optional PW 1x1) -> BN -> DyReLU
+#       3) Output: concat(primary, expansion) along channels
+
+#     The DW branch is implemented as true depthwise on the primary features, then a PW 1x1
+#     to reach the required cheap channels (common Ghost-style cheap feature generation).
+#     """
+#     def __init__(
+#         self,
+#         in_channels: int,
+#         out_channels: int,
+#         kernel: int = 3,         # DW kernel size (3 or 5)
+#         stride: int = 1,
+#         ratio: int = 2,          # primary = ceil(out/ratio), cheap = out - primary
+#         dyrelu_reduction: int = 4,
+#         a_min: float = 0.0,
+#         a_max: float = 2.0,
+#     ):
+#         super().__init__()
+#         assert out_channels > 0
+#         assert ratio >= 1
+        
+#         # Ensure kernel is odd and >= 3
+#         if kernel < 3:
+#             kernel = 3
+#         if kernel % 2 == 0:
+#             kernel += 1
+
+#         primary = int((out_channels + ratio - 1) // ratio)  # ceil(out/ratio)
+#         cheap = out_channels - primary
+#         if cheap <= 0:
+#             primary = max(out_channels - 1, 1)
+#             cheap = out_channels - primary
+
+#         self.primary_channels = primary
+#         self.cheap_channels = cheap
+
+#         # Primary: 1x1
+#         self.pw = nn.Conv2d(in_channels, primary, kernel_size=1, stride=stride, padding=0, bias=False)
+#         self.pw_bn = nn.BatchNorm2d(primary)
+#         self.pw_act = DyReLU(primary, reduction=dyrelu_reduction, a_min=a_min, a_max=a_max)
+
+#         # Expansion: depthwise 5x5 (on primary output) + pointwise 1x1 to cheap channels
+#         # Use autopad for correct 'same' padding 
+#         pad = autopad(kernel)
+#         self.dw = nn.Conv2d(primary, primary, kernel_size=kernel, stride=1, padding=pad,
+#                             groups=primary, bias=False)
+#         self.dw_pw = nn.Conv2d(primary, cheap, kernel_size=1, stride=1, padding=0, bias=False)
+
+#         self.dw_bn = nn.BatchNorm2d(cheap)
+#         self.dw_act = DyReLU(cheap, reduction=dyrelu_reduction, a_min=a_min, a_max=a_max)
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         y1 = self.pw_act(self.pw_bn(self.pw(x)))          # primary features
+#         y2 = self.dw_pw(self.dw(y1))                      # spatial cheap features
+#         y2 = self.dw_act(self.dw_bn(y2))
+#         return torch.cat([y1, y2], dim=1)
+
+# class DyReLU(nn.Module):
+#     """
+#     Dynamic ReLU (2-piece):
+#         y = max(a1*x + b1, a2*x + b2)
+#     where (a1,b1,a2,b2) are predicted per-channel via GAP + 1x1 convs.
+
+#     Lightweight: negligible overhead vs standard activations.
+#     """
+#     def __init__(
+#         self,
+#         channels: int,
+#         reduction: int = 4,
+#         a_min: float = 0.0,
+#         a_max: float = 2.0,
+#     ):
+#         super().__init__()
+#         hidden = max(channels // reduction, 4)
+
+#         self.pool = nn.AdaptiveAvgPool2d(1)
+#         self.fc1 = nn.Conv2d(channels, hidden, kernel_size=1, bias=True)
+#         self.fc2 = nn.Conv2d(hidden, channels * 4, kernel_size=1, bias=True)
+
+#         self.a_min = a_min
+#         self.a_max = a_max
+
+#         # Stabilize start: near-identity / ReLU-ish behavior initially
+#         nn.init.zeros_(self.fc2.weight)
+#         nn.init.zeros_(self.fc2.bias)
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         b, c, _, _ = x.shape
+
+#         s = self.pool(x)
+#         s = F.relu(self.fc1(s), inplace=True)
+#         theta = self.fc2(s).view(b, 4, c, 1, 1)
+
+#         a1 = theta[:, 0]
+#         b1 = theta[:, 1]
+#         a2 = theta[:, 2]
+#         b2 = theta[:, 3]
+
+#         # Constrain slopes for stability
+#         a1 = torch.sigmoid(a1) * (self.a_max - self.a_min) + self.a_min
+#         a2 = torch.sigmoid(a2) * (self.a_max - self.a_min) + self.a_min
+
+#         y1 = a1 * x + b1
+#         y2 = a2 * x + b2
+#         return torch.maximum(y1, y2)
+
+# class GDRConv(nn.Module):
+#     def __init__(self, c1, c2, k=1, s=1, dyrelu_reduction=4, a_min=0.0, a_max=2.0):
+#         super().__init__()
+#         assert c2 % 2 == 0, "This exact half/half design assumes c2 is even."
+
+#         hidden = c2 // 2
+
+#         self.primary = nn.Sequential(
+#             nn.Conv2d(c1, hidden, k, s, autopad(k), bias=False),
+#             nn.BatchNorm2d(hidden),
+#             DyReLU(hidden, reduction=dyrelu_reduction, a_min=a_min, a_max=a_max),
+#         )
+
+#         self.cheap = nn.Sequential(
+#             nn.Conv2d(hidden, hidden, 5, 1, autopad(5), groups=hidden, bias=False),  # padding=2
+#             nn.BatchNorm2d(hidden),
+#             DyReLU(hidden, reduction=dyrelu_reduction, a_min=a_min, a_max=a_max),
+#         )
+
+#     def forward(self, x):
+#         y1 = self.primary(x)
+#         y2 = self.cheap(y1)
+#         return torch.cat([y1, y2], dim=1)
+
+class TDAM(nn.Module):
+    def __init__(self, channels, reduction=4):
+        super().__init__()
+        hidden = max(channels // reduction, 8)
+
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Linear(channels, hidden)
+        self.fc2 = nn.Linear(hidden, channels)
+        self.act = nn.ReLU(inplace=True)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.pool(x).view(b, c)
+        y = self.fc1(y)
+        y = self.act(y)
+        y = self.fc2(y)
+        y = self.sigmoid(y).view(b, c, 1, 1)
+        return x * y
+
+class GTDRBlock(nn.Module):
+    def __init__(self, c1, c2):
+        super().__init__()
+        self.conv = GDRConv(c1, c2)
+        self.attn = TDAM(c2)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.attn(x)
+        return x
+
+class GTDRC3(nn.Module):
+    """
+    Faithful implementation based on paper paragraph.
+    """
+    print(">>> USING GTDRC3 Bottleneck <<<")
+
+    def __init__(self, c1, c2, n=1, shortcut=True):
+        super().__init__()
+
+        # First GTDRBlock
+        self.block1 = GTDRBlock(c1, c2)
+
+        # Second GTDRBlock
+        self.block2 = GTDRBlock(c2, c2)
+
+        # GhostBottleneck repetitions
+        self.gb_blocks = nn.Sequential(
+            *[GhostBottleneck(c2, c2) for _ in range(n)]
+        )
+
+        # Fusion block (after concat)
+        self.fusion = GTDRBlock(2 * c2, c2)
+
+        self.shortcut = shortcut and c1 == c2
+
+    def forward(self, x):
+        identity = x
+
+        # Sequential main branch
+        y1 = self.block1(x)
+        y2 = self.block2(y1)
+        y3 = self.gb_blocks(y2)
+
+        # Concat first GTDRBlock output and final output
+        out = torch.cat((y1, y3), dim=1)
+
+        # Fusion
+        out = self.fusion(out)
+
+        # Residual
+        if self.shortcut:
+            out = out + identity
+
+        return out
+
+# -------------------------
+# NEW CTDAM (attention only swap)
+# -------------------------
+class CTDAM(nn.Module):
+    """
+    Competitive TDAM (Channel competition + optional spatial context).
+    Minimal integration: this module REPLACES TDAM; no other topology changes required.
+    """
+    def __init__(
+        self,
+        channels: int,
+        reduction: int = 4,
+        temperature: float = 1.5,
+        groups: int = 8,
+        use_spatial_dw: bool = True,
+        dw_kernel: int = 3,
+        init_gamma: float = 1.0,
+    ):
+        super().__init__()
+        hidden = max(channels // reduction, 8)
+
+        self.channels = channels
+        self.temperature = max(float(temperature), 1e-6)
+        self.groups = int(max(groups, 1))
+        assert channels % self.groups == 0, f"CTDAM: channels={channels} must be divisible by groups={self.groups}"
+
+        if use_spatial_dw:
+            pad = dw_kernel // 2
+            self.spatial = nn.Conv2d(channels, channels, dw_kernel, 1, pad, groups=channels, bias=False)
+        else:
+            self.spatial = nn.Identity()
+
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Linear(channels, hidden)
+        self.fc2 = nn.Linear(hidden, channels)
+        self.act = nn.ReLU(inplace=True)
+
+        self.gamma = nn.Parameter(torch.ones(1) * float(init_gamma))
+
+    def _softmax_grouped(self, logits: torch.Tensor) -> torch.Tensor:
+        B, C = logits.shape
+        G = self.groups
+        cg = C // G
+        x = logits.view(B, G, cg) / self.temperature
+        w = F.softmax(x, dim=-1)
+        w = w * cg  # keep mean gate ~1
+        return w.view(B, C)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        xs = self.spatial(x)
+        y = self.pool(xs).view(B, C)
+        y = self.fc1(y)
+        y = self.act(y)
+        y = self.fc2(y)
+        gates = self._softmax_grouped(y).view(B, C, 1, 1)
+
+        # identity-friendly scaling
+        return x * (1.0 + self.gamma * (gates - 1.0))
+
+# -------------------------
+# Minimal-change GTDRBlock swap: TDAM -> CTDAM only
+# -------------------------
+class GTDRBlock_CTDAM(nn.Module):
+    def __init__(self, c1, c2,
+                 attn_reduction=4, attn_temp=1.5, attn_groups=8, use_spatial_dw=True):
+        super().__init__()
+        self.conv = GDRConv(c1, c2)
+        self.attn = CTDAM(
+            c2,
+            reduction=attn_reduction,
+            temperature=attn_temp,
+            groups=attn_groups,
+            use_spatial_dw=use_spatial_dw,
+            dw_kernel=3,
+            init_gamma=1.0,
+        )
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.attn(x)
+        return x
+
+# -------------------------
+# Minimal-change GTDRC3: same structure, only block class swapped (THIS IS THE BEST PERFORMER SO FAR: To test P4 or P5 swap out)
+# -------------------------
+class GTDRC3_CTDAM(nn.Module):
+    """
+    Identical architecture to GTDRC3, except TDAM is replaced by CTDAM
+    in block1, block2, and fusion.
+    """
+    print(">>> USING GTDRC3_CTDAM Bottleneck <<<")
+
+    def __init__(self, c1, c2, n=1, shortcut=True):
+        super().__init__()
+
+        self.block1 = GTDRBlock_CTDAM(c1, c2)
+        self.block2 = GTDRBlock_CTDAM(c2, c2)
+
+        self.gb_blocks = nn.Sequential(
+            *[GhostBottleneck(c2, c2) for _ in range(n)]
+        )
+
+        self.fusion = GTDRBlock_CTDAM(2 * c2, c2)
+
+        self.shortcut = shortcut and c1 == c2
+
+    def forward(self, x):
+        identity = x
+        y1 = self.block1(x)
+        y2 = self.block2(y1)
+        y3 = self.gb_blocks(y2)
+        out = torch.cat((y1, y3), dim=1)
+        out = self.fusion(out)
+        if self.shortcut:
+            out = out + identity
+        return out
 
 
 class C3k(C3):
@@ -738,6 +1640,7 @@ class C3k(C3):
 
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, k=3):
         """Initializes the C3k module with specified channels, number of layers, and configurations."""
+        print(">>> USING C3k Bottleneck <<<")
         super().__init__(c1, c2, n, shortcut, g, e)
         c_ = int(c2 * e)  # hidden channels
         # self.m = nn.Sequential(*(RepBottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
@@ -1347,7 +2250,7 @@ class A2C2f(nn.Module):
         c_ = int(c2 * e)  # hidden channels
         assert c_ % 32 == 0, "Dimension of ABlock be a multiple of 32."
 
-        # num_heads = c_ // 64 if c_ // 64 >= 2 else c_ // 32
+        # num_heads = c_ // 64 if c_ //64 >= 2 else c_ // 32
         num_heads = c_ // 32
 
         self.cv1 = Conv(c1, c_, 1, 1)
@@ -1357,7 +2260,8 @@ class A2C2f(nn.Module):
         self.gamma = nn.Parameter(init_values * torch.ones((c2)), requires_grad=True) if a2 and residual else None
 
         self.m = nn.ModuleList(
-            nn.Sequential(*(ABlock(c_, num_heads, mlp_ratio, area) for _ in range(2))) if a2 else C3k(c_, c_, 2, shortcut, g) for _ in range(n)
+            nn.Sequential(*(ABlock(c_, num_heads, mlp_ratio, area) for _ in range(2))) 
+            if a2 else C3k(c_, c_, 2, shortcut, g) for _ in range(n)
         )
 
     def forward(self, x):

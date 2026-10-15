@@ -1,4 +1,5 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """
 Ultralytics modules.
 
@@ -35,12 +36,17 @@ from .block import (
     Attention,
     BNContrastiveHead,
     Bottleneck,
+    SpatialBottleneck,
     BottleneckCSP,
     C2f,
     C2fAttn,
     C2fCIB,
     C2fPSA,
     C3Ghost,
+    C3HorNet,
+    C3HorBlock,
+    C3HorBlock_light,
+    NAM,
     C3k2,
     C3x,
     CBFuse,
@@ -58,6 +64,20 @@ from .block import (
     SCDown,
     TorchVision,
     A2C2f,
+    DropPath,
+    HorBlock,
+    GDRConv,
+    TDAM,
+    GTDRBlock,
+    GTDRBlock_CTDAM,
+    CTDAM,
+    GTDRC3,
+    GTDRC3_CTDAM,
+    HARFM,
+    FFAM,
+    ELA,
+    DyHead,
+    DyHeadBlock       
 )
 from .conv import (
     CBAM,
@@ -117,6 +137,12 @@ __all__ = (
     "C3",
     "C2f",
     "C3k2",
+    "C3HorNet",
+    "C3HorNet",
+    "C3HorBlock",
+    "C3HorBlock_light",
+    "NAM",
+    "SpatialBottleneck",
     "SCDown",
     "C2fPSA",
     "C2PSA",
@@ -161,5 +187,19 @@ __all__ = (
     "PSA",
     "TorchVision",
     "Index",
-    "A2C2f"
+    "A2C2f",
+    "DropPath",
+    "HorBlock",
+    "GDRConv",
+    "TDAM",
+    "GTDRBlock",
+    "GTDRBlock_CTDAM",
+    "CTDAM",
+    "GTDRC3",
+    "GTDRC3_CTDAM",
+    "HARFM",
+    "FFAM",
+    "ELA",
+    "DyHead",
+    "DyHeadBlock"
 )

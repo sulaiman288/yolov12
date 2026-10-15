@@ -73,7 +73,8 @@ from ultralytics.data import build_dataloader
 from ultralytics.data.dataset import YOLODataset
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
 from ultralytics.nn.autobackend import check_class_names, default_class_names
-from ultralytics.nn.modules import C2f, Classify, Detect, RTDETRDecoder
+from ultralytics.nn.modules import C2f, C3HorNet, C3HorBlock, Classify, Detect, RTDETRDecoder
+from ultralytics.nn.modules.block import SpatialBottleneck, C3HorBlock
 from ultralytics.nn.tasks import DetectionModel, SegmentationModel, WorldModel
 from ultralytics.utils import (
     ARM64,
@@ -328,7 +329,7 @@ class Exporter:
                 m.export = True
                 m.format = self.args.format
                 m.max_det = self.args.max_det
-            elif isinstance(m, C2f) and not is_tf_format:
+            elif isinstance(m, (C2f, C3HorNet, C3HorBlock, SpatialBottleneck)) and not is_tf_format:
                 # EdgeTPU does not support FlexSplitV while split provides cleaner ONNX graph
                 m.forward = m.forward_split
             if isinstance(m, Detect) and imx:

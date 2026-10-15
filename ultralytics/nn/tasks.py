@@ -33,6 +33,10 @@ from ultralytics.nn.modules import (
     C2fCIB,
     C2fPSA,
     C3Ghost,
+    C3HorNet,
+    C3HorBlock,
+    C3HorBlock_light,
+    SpatialBottleneck,
     C3k2,
     C3x,
     CBFuse,
@@ -65,7 +69,23 @@ from ultralytics.nn.modules import (
     WorldDetect,
     v10Detect,
     A2C2f,
+    NAM,
+    DropPath,
+    HorBlock,
+    GDRConv,
+    TDAM,
+    CTDAM,
+    GTDRBlock,
+    GTDRBlock_CTDAM,
+    GTDRC3,
+    GTDRC3_CTDAM,
+    ELA,
+    HARFM,
+    FFAM,
+    DyHead,
+    DyHeadBlock,
 )
+from ultralytics.nn.modules.block import NAM
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
@@ -962,12 +982,35 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 with contextlib.suppress(ValueError):
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
         n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
-        if m in {
+        
+        if m is HARFM:
+            c1 = [ch[x] for x in f]   # expects two inputs
+            c2 = args[0]
+            if c2 != nc:
+                c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1, c2, *args[1:]]
+
+        elif m is FFAM:
+            c1 = [ch[x] for x in f]   # expects three inputs
+            c2 = args[0]
+            if c2 != nc:
+                c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1, c2, *args[1:]]
+
+        elif m in {DyHead, DyHeadBlock}:
+            c1 = ch[f]
+            c2 = args[0]
+            if c2 != nc:
+                c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1, c2, *args[1:]]
+        
+        elif m in {
             Classify,
             Conv,
             ConvTranspose,
             GhostConv,
             Bottleneck,
+            SpatialBottleneck,
             GhostBottleneck,
             SPP,
             SPPF,
@@ -980,6 +1023,9 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             C2,
             C2f,
             C3k2,
+            C3HorNet,
+            C3HorBlock,
+            C3HorBlock_light,
             RepNCSPELAN4,
             ELAN1,
             ADown,
@@ -997,6 +1043,17 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             SCDown,
             C2fCIB,
             A2C2f,
+            NAM,
+            GDRConv,
+            TDAM,
+            CTDAM,
+            GTDRBlock,
+            GTDRBlock_CTDAM,
+            GTDRC3,
+            GTDRC3_CTDAM,
+            ELA,
+            DyHead,
+            DyHeadBlock
         }:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
@@ -1014,6 +1071,9 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 C2,
                 C2f,
                 C3k2,
+                C3HorNet,
+                C3HorBlock,
+                C3HorBlock_light,
                 C2fAttn,
                 C3,
                 C3TR,
@@ -1024,6 +1084,13 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 C2fCIB,
                 C2PSA,
                 A2C2f,
+                NAM,
+                GTDRC3,
+                GTDRC3_CTDAM,
+                ELA,
+                DyHead,
+                DyHeadBlock
+
             }:
                 args.insert(2, n)  # number of repeats
                 n = 1

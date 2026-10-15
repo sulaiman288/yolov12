@@ -23,6 +23,7 @@ from ultralytics.data.loaders import (
 from ultralytics.data.utils import IMG_FORMATS, PIN_MEMORY, VID_FORMATS
 from ultralytics.utils import RANK, colorstr
 from ultralytics.utils.checks import check_file
+from ultralytics.cfg import get_cfg
 
 
 class InfiniteDataLoader(dataloader.DataLoader):
@@ -119,7 +120,7 @@ def build_grounding(cfg, img_path, json_file, batch, mode="train", rect=False, s
         imgsz=cfg.imgsz,
         batch_size=batch,
         augment=mode == "train",  # augmentation
-        hyp=cfg,  # TODO: probably add a get_hyps_from_cfg function
+        hyp=cfg,  # TODO probably add a get_hyps_from_cfg function
         rect=cfg.rect or rect,  # rectangular batches
         cache=cfg.cache or None,
         single_cls=cfg.single_cls or False,
